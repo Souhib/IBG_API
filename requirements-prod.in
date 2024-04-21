@@ -1,0 +1,10 @@
+fastapi
+SQLAlchemy
+SQLModel
+uvicorn
+httpx
+PyYAML
+python-dotenv
+bcrypt
+passlib
+pydantic-settings

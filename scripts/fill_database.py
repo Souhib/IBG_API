@@ -1,16 +1,26 @@
+import asyncio
 import random
+import string
 from datetime import timedelta
 
+import pycountry
 from faker import Faker
-from sqlmodel import SQLModel, create_engine, Session
+from sqlmodel import Session, SQLModel, create_engine
 
-from ibg.models.undercover import Word, TermPair
-from ibg.models.game import GameType
-from ibg.models.models import Game, User
+from ibg.api.controllers.room import RoomController
+from ibg.api.controllers.undercover import UndercoverController
+from ibg.api.controllers.user import UserController
+from ibg.api.models.game import GameType
+from ibg.api.models.room import RoomCreate, RoomJoin, RoomStatus
+from ibg.api.models.table import Game, User
+from ibg.api.models.undercover import Word
+from ibg.api.models.user import UserCreate
+from ibg.socketio.models.room import Room as RedisRoom
+from ibg.socketio.models.user import User as RedisUser
 
 DATABASE_URL = "sqlite:///database.db"
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 
 fake = Faker()
 
@@ -149,11 +159,7 @@ def generate_sample_games(users: list[User], num_games: int) -> list[Game]:
         Game(
             user_id=(random.choice(users)).id,
             start_time=(start_time := fake.past_datetime(start_date="-30d")),
-            end_time=(
-                start_time + timedelta(minutes=random.randint(1, 15))
-                if random.choice([True, False])
-                else None
-            ),
+            end_time=(start_time + timedelta(minutes=random.randint(1, 15)) if random.choice([True, False]) else None),
             number_of_players=random.randint(1, 8),
             type=random.choice(list(GameType)),
         )
@@ -161,31 +167,69 @@ def generate_sample_games(users: list[User], num_games: int) -> list[Game]:
     ]
 
 
-def insert_sample_data() -> None:
-    users = generate_fake_users(15)
-    with Session(engine) as session:
+async def insert_sample_data() -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        user_controller = UserController(session)
+        room_controller = RoomController(session)
+        # game_controller = GameController(session)
+        undercover_controller = UndercoverController(session)
+
+        users = [
+            await user_controller.create_user(
+                UserCreate(
+                    username=fake.user_name(),
+                    email_address=fake.email(),
+                    country=random.choice([country.alpha_3 for country in pycountry.countries]),
+                    password=fake.password(),
+                )
+            )
+            for _ in range(4)
+        ]
+
+        owner = random.choice(users)
+
+        room = await room_controller.create_room(
+            RoomCreate(
+                status=random.choice(list(RoomStatus)),
+                password="".join(random.choice(string.digits) for _ in range(4)),
+                owner_id=owner.id,
+            )
+        )
+
+        redis_users = []
+        for index, user in enumerate(users):
+            new_user = RedisUser(id=str(user.id), username=user.username, sid=fake.uuid4())
+            await new_user.save()
+            redis_users.append(new_user)
+            print(f"User {index + 1} has sid {new_user.sid}")
+
+        redis_room = RedisRoom(id=str(room.id), users=redis_users)
+        await redis_room.save()
+
         for user in users:
-            session.add(user)
+            if user.id != room.owner_id:
+                await room_controller.join_room(RoomJoin(room_id=room.id, user_id=user.id, password=room.password))
 
-        session.commit()
+        for sample_word in sample_words:
+            new_word = Word(**sample_word)
+            session.add(new_word)
+            session.commit()
 
-        for word_data in sample_words:
-            word = Word(**word_data)
-            session.add(word)
-        session.commit()
+        for sample_pair in sample_pairs:
+            await undercover_controller.create_term_pair(
+                word1_id=sample_pair["word1_id"], word2_id=sample_pair["word2_id"]
+            )
 
-        for pair_data in sample_pairs:
-            term_pair = TermPair(**pair_data)
-            session.add(term_pair)
-        session.commit()
-
-        games = generate_sample_games(users, 10)  # Generate 10 sample games
-        for game in games:
-            session.add(game)
-        session.commit()
+    # game = await game_controller.create_game(
+    #     GameCreate(
+    #         room_id=room.id,
+    #         number_of_players=len(users),
+    #         type=GameType.UNDERCOVER
+    #     )
+    # )
 
 
 if __name__ == "__main__":
     create_db_and_tables()
-    insert_sample_data()
+    asyncio.run(insert_sample_data())
     print("Database populated with sample data.")

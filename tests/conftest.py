@@ -1,20 +1,18 @@
+import os
+
 import pytest
+import redis
 from faker import Faker
 from fastapi import FastAPI
-from sqlalchemy import create_engine, Engine
-from sqlalchemy.event import listens_for
-from sqlalchemy.exc import NoResultFound
-from sqlmodel import SQLModel, Session
-from starlette.middleware.cors import CORSMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.testclient import TestClient
+from sqlalchemy import Engine, create_engine
+from sqlmodel import Session, SQLModel
+from testcontainers.core.container import DockerContainer
+from testcontainers.postgres import PostgresContainer
 
-from ibg.controllers.game import GameController
-from ibg.controllers.room import RoomController
-from ibg.controllers.undercover import UndercoverController
-from ibg.controllers.user import UserController
-from ibg.models.errors import BaseError
+from ibg.api.controllers.game import GameController
+from ibg.api.controllers.room import RoomController
+from ibg.api.controllers.undercover import UndercoverController
+from ibg.api.controllers.user import UserController
 
 
 @pytest.fixture(name="faker")
@@ -22,27 +20,54 @@ def get_faker() -> Faker:
     return Faker("fr_FR")
 
 
-@pytest.fixture(name="engine")
-def generate_test_db_engine():
-    engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
+@pytest.fixture(name="postgres", scope="session", autouse=True)
+def generate_test_pgsql():
+    with PostgresContainer("postgres:latest") as postgres:
+        postgres.with_env("POSTGRES_USER", "test")
+        postgres.with_env("POSTGRES_PASSWORD", "testpassword")
+        postgres.with_env("POSTGRES_DB", "testdb")
+        yield postgres
 
-    @listens_for(engine, "connect")
-    def set_sqlite_pragma(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
 
+@pytest.fixture(name="engine", scope="session", autouse=True)
+def generate_socket_test_pgsql_engine(postgres):
+    engine = create_engine(postgres.get_connection_url())
     SQLModel.metadata.create_all(engine)
-    return engine
+    yield engine
 
 
 @pytest.fixture(name="session")
 def generate_test_db_session(engine: Engine) -> Session:
     with Session(engine) as session:
         yield session
+
+
+@pytest.fixture(name="redis_container", scope="session", autouse=True)
+def redis_container() -> DockerContainer:
+    with DockerContainer("redislabs/redisearch:latest").with_exposed_ports(6379) as container:
+        yield container
+
+
+@pytest.fixture(name="redis_host_and_port", scope="session", autouse=True)
+def redis_host_and_port(redis_container: DockerContainer) -> tuple[str, int]:
+    host = redis_container.get_container_host_ip()
+    port = redis_container.get_exposed_port(6379)
+    yield host, port
+
+
+@pytest.fixture(autouse=True)
+def clear_database_and_redis(engine: Engine, redis_host_and_port: tuple[str, int], request):
+    yield
+    # We check if the test is a controller test to avoid dropping the database, we're doing this for performance reasons
+    if "controller" in str(request.node.fspath):
+        host, port = redis_host_and_port
+        SQLModel.metadata.drop_all(engine)
+        SQLModel.metadata.create_all(engine)
+        if "sockets" in str(request.node.fspath):
+            r = redis.Redis(host=host, port=port, db=0)
+            r.flushdb()
+            for key in r.scan_iter("ibg:*"):
+                r.delete(key)
 
 
 @pytest.fixture(name="user_controller")
@@ -65,44 +90,14 @@ def get_room_controller(session: Session) -> RoomController:
     return RoomController(session)
 
 
-def get_test_app() -> tuple[FastAPI, TestClient]:
-    from ibg.routers.user import router as user_router
-    from ibg.routers.game import router as game_router
-    from ibg.routers.socket import router as socket_router
-    from ibg.routers.room import router as room_router
-    from ibg.routers.undercover import router as undercover_router
+@pytest.fixture(name="app", scope="session")
+def get_test_app(postgres: PostgresContainer, redis_host_and_port: tuple[str, int]) -> FastAPI:
+    host, port = redis_host_and_port
+    os.environ["DATABASE_URL"] = postgres.get_connection_url()
+    os.environ["REDIS_OM_URL"] = f"redis://{host}:{port}"
+    os.environ["LOGFIRE_TOKEN"] = "fake_token"
+    from ibg.app import create_app  # Import here because environment variables need to be set before importing the app
+    from main import lifespan  # Import here because environment variables need to be set before importing the app
 
-    origins = ["*"]
-    app = FastAPI(title="IBG")
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    app.include_router(user_router)
-    app.include_router(game_router)
-    app.include_router(socket_router)
-    app.include_router(room_router)
-    app.include_router(undercover_router)
-
-    @app.exception_handler(NoResultFound)
-    async def unicorn_exception_handler(request: Request, exc: NoResultFound):
-        return JSONResponse(
-            status_code=404,
-            content={"message": "Couldn't find requested resource"},
-        )
-
-    @app.exception_handler(BaseError)
-    async def base_error_exception_handler(request: Request, exc: BaseError):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "name": exc.name,
-                "message": exc.message,
-                "status_code": exc.status_code,
-            },
-        )
-
-    return app, TestClient(app)
+    app = create_app(lifespan=lifespan)
+    return app

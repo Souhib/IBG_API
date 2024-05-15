@@ -1,10 +1,10 @@
 import asyncio
-from sqlmodel import SQLModel
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlmodel import SQLModel
 
 # Update with your actual database URL
-sqlite_file_name = "database.db"
+sqlite_file_name = "test.db"
 sqlite_url = f"sqlite+aiosqlite:///{sqlite_file_name}"
 
 

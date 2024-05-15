@@ -8,6 +8,8 @@
 .idea
 
 database.db
+test.db
+.logfire
 
 # User-specific stuff
 .idea/**/workspace.xml
